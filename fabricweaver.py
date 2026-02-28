@@ -1,11 +1,21 @@
-# fabricweaver/fabricweaver.py
 import tkinter as tk
 from tkinter import messagebox
 
-def main() -> None:
+def main():
     root = tk.Tk()
-    messagebox.showerror("PROOF", "If you see this, you ARE running fabricweaver/fabricweaver.py.")
-    raise SystemExit("PROOF STOP")
+    root.title("FabricWeaver")
+    root.geometry("1200x750")
+
+    try:
+        from ui.layout import FabricWeaverApp
+    except Exception as e:
+        messagebox.showerror("Startup Error", f"Failed to load UI:\n\n{e}")
+        return
+
+    app = FabricWeaverApp(root)
+    app.pack(fill="both", expand=True)
+
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
