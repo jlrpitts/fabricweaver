@@ -1,0 +1,6 @@
+Flask==3.0.3
+Werkzeug==3.0.3
+netmiko==4.4.0
+
+PyQt6==6.7.1
+PyQt6-WebEngine==6.7.0
