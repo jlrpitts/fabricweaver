@@ -1,9 +1,11 @@
 # fabricweaver/ui/layout.py
 # Tkinter layout (Devices / Topology / Raw Data + Options)
+
 from __future__ import annotations
 
 import os
 import re
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -58,66 +60,48 @@ class TopologyData:
 
 
 # -----------------------------
-# Light parser fallback (works without your core/parser modules)
+# Lightweight parser fallback (NX-OS aware)
 # -----------------------------
-
 HOST_RE = re.compile(r"^\s*hostname\s+(\S+)", re.IGNORECASE | re.MULTILINE)
-VLAN_RE = re.compile(r"^\s*vlan\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
-VLAN_NAME_RE = re.compile(r"^\s*name\s+(.+)$", re.IGNORECASE | re.MULTILINE)
-INT_RE = re.compile(r"^\s*interface\s+(\S+)", re.IGNORECASE | re.MULTILINE)
-IP_RE = re.compile(r"^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)", re.IGNORECASE | re.MULTILINE)
+INT_RE = re.compile(r"^\s*interface\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 
-NXOS_VENDOR_HINT = re.compile(r"nxos|nexus|feature\s+vpc|vpc\s+domain", re.IGNORECASE)
-IOS_VENDOR_HINT = re.compile(r"catalyst|ios|spanning-tree|switchport", re.IGNORECASE)
-ARISTA_HINT = re.compile(r"arista|eos|transceiver\s+qsfp|daemon\s+terminattr", re.IGNORECASE)
-DELL_OS10_HINT = re.compile(r"os10|dell\s+emc|interface\s+vlan|vlt\s+domain", re.IGNORECASE)
+# NX-OS / IOS mask format
+IP_MASK_RE = re.compile(
+    r"^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# NX-OS prefix format (very common)
+IP_PREFIX_RE = re.compile(
+    r"^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d{1,2})\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+VLAN_HDR_RE = re.compile(r"^\s*vlan\s+([0-9,\-\s]+)\s*$", re.IGNORECASE | re.MULTILINE)
+VLAN_NAME_RE = re.compile(r"^\s*name\s+(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+# -----------------------------
+# Vendor detection (FIXED)
+# -----------------------------
+# The bug you hit: treating "interface vlan" as Dell.
+# NX-OS also uses "interface Vlan###", so that's a false-positive.
+# Use strong Dell-only hints, and evaluate NX-OS before Dell.
+NXOS_VENDOR_HINT = re.compile(r"\bnxos\b|\bnexus\b|feature\s+vpc|vpc\s+domain", re.IGNORECASE)
+IOS_VENDOR_HINT = re.compile(r"\bcatalyst\b|\bios\b|\bios-xe\b|switchport|spanning-tree", re.IGNORECASE)
+ARISTA_HINT = re.compile(r"\barista\b|\beos\b|terminattr|management\s+api", re.IGNORECASE)
+DELL_OS10_HINT = re.compile(r"\bos10\b|dell\s+emc|\bvlt\s+domain\b|\bsmartfabric\b", re.IGNORECASE)
 
 
 def _guess_vendor(text: str) -> str:
-    if DELL_OS10_HINT.search(text):
-        return "Dell OS10"
+    # Order matters: check strongest + most specific first.
     if ARISTA_HINT.search(text):
         return "Arista EOS"
     if NXOS_VENDOR_HINT.search(text):
         return "Cisco Nexus (NX-OS)"
+    if DELL_OS10_HINT.search(text):
+        return "Dell OS10"
     if IOS_VENDOR_HINT.search(text):
         return "Cisco Catalyst (IOS/IOS-XE)"
     return "AUTODETECT"
-
-
-def _parse_vlans(text: str) -> List[VlanInfo]:
-    vlans: List[VlanInfo] = []
-    for m in VLAN_RE.finditer(text):
-        vid = m.group(1)
-        # Try to find "name" within the vlan block by looking ahead a bit
-        start = m.end()
-        window = text[start:start + 250]
-        nm = VLAN_NAME_RE.search(window)
-        name = nm.group(1).strip() if nm else "—"
-        vlans.append(VlanInfo(vid=vid, name=name))
-    # de-dupe by VLAN ID
-    seen = set()
-    out: List[VlanInfo] = []
-    for v in vlans:
-        if v.vid not in seen:
-            seen.add(v.vid)
-            out.append(v)
-    return out[:80]
-
-
-def _parse_l3_ints(text: str) -> List[InterfaceIP]:
-    # Naive: find interface blocks, then ip address lines after each interface header
-    results: List[InterfaceIP] = []
-    for im in INT_RE.finditer(text):
-        ifname = im.group(1)
-        start = im.end()
-        window = text[start:start + 400]
-        ipm = IP_RE.search(window)
-        if ipm:
-            ip = f"{ipm.group(1)}/{_mask_to_prefix(ipm.group(2))}"
-            results.append(InterfaceIP(name=ifname, ip=ip))
-    # keep only first N for UI
-    return results[:50]
 
 
 def _mask_to_prefix(mask: str) -> int:
@@ -126,8 +110,117 @@ def _mask_to_prefix(mask: str) -> int:
     return bits.count("1")
 
 
+def _expand_vlan_spec(spec: str) -> List[str]:
+    """
+    Expand "10,20,30-32" -> ["10","20","30","31","32"].
+    """
+    out: List[str] = []
+    spec = spec.replace(" ", "")
+    for chunk in spec.split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                start = int(a)
+                end = int(b)
+                if start <= end:
+                    out.extend([str(v) for v in range(start, end + 1)])
+        else:
+            if chunk.isdigit():
+                out.append(chunk)
+    return out
+
+
+def _parse_vlans(text: str) -> List[VlanInfo]:
+    """
+    Works with:
+      vlan 10
+        name USERS
+      vlan 10,20,30
+        name SERVERS
+      vlan 100-110
+        name TRANSIT
+    """
+    vlan_map: Dict[str, VlanInfo] = {}
+    current_vids: List[str] = []
+
+    for line in text.splitlines():
+        hm = VLAN_HDR_RE.match(line)
+        if hm:
+            current_vids = _expand_vlan_spec(hm.group(1))
+            for vid in current_vids:
+                vlan_map.setdefault(vid, VlanInfo(vid=vid, name="—"))
+            continue
+
+        nm = VLAN_NAME_RE.match(line)
+        if nm and current_vids:
+            name = nm.group(1).strip()
+            for vid in current_vids:
+                vlan_map[vid] = VlanInfo(vid=vid, name=name)
+
+    def sort_key(v: VlanInfo) -> int:
+        try:
+            return int(v.vid)
+        except Exception:
+            return 0
+
+    return sorted(vlan_map.values(), key=sort_key)[:300]
+
+
+def _parse_interface_block_ip(block_text: str) -> Optional[str]:
+    m = IP_PREFIX_RE.search(block_text)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = IP_MASK_RE.search(block_text)
+    if m:
+        return f"{m.group(1)}/{_mask_to_prefix(m.group(2))}"
+    return None
+
+
+def _iter_interface_blocks(text: str) -> List[Tuple[str, str]]:
+    """
+    Returns list of (ifname, block_text) where block_text is the lines
+    between this interface header and the next interface header.
+    """
+    matches = list(INT_RE.finditer(text))
+    blocks: List[Tuple[str, str]] = []
+    for idx, im in enumerate(matches):
+        ifname = im.group(1)
+        start = im.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        blocks.append((ifname, text[start:end]))
+    return blocks
+
+
+def _parse_l3_ints(text: str) -> List[InterfaceIP]:
+    """
+    Finds interface blocks with IPs.
+    NX-OS commonly: ip address A.B.C.D/NN
+    IOS commonly:   ip address A.B.C.D MASK
+    """
+    out: List[InterfaceIP] = []
+    for ifname, block in _iter_interface_blocks(text):
+        ip = _parse_interface_block_ip(block)
+        if ip:
+            out.append(InterfaceIP(name=ifname, ip=ip))
+    return out[:120]
+
+
+def _parse_mgmt0_ip(text: str) -> str:
+    """
+    Prefer mgmt0 address if found.
+    """
+    for ifname, block in _iter_interface_blocks(text):
+        if ifname.lower() == "mgmt0":
+            ip = _parse_interface_block_ip(block)
+            return ip or "—"
+    return "—"
+
+
 def parse_configs_fallback(paths: List[str]) -> TopologyData:
     topo = TopologyData()
+
     for p in paths:
         try:
             text = open(p, "r", encoding="utf-8", errors="ignore").read()
@@ -137,10 +230,15 @@ def parse_configs_fallback(paths: List[str]) -> TopologyData:
         hostm = HOST_RE.search(text)
         hostname = hostm.group(1) if hostm else os.path.splitext(os.path.basename(p))[0]
 
+        vendor = _guess_vendor(text)
+        mgmt_ip = _parse_mgmt0_ip(text)
+        if mgmt_ip == "—":
+            mgmt_ip = "STATIC_FILE"
+
         d = DeviceSummary(
             hostname=hostname,
-            vendor=_guess_vendor(text),
-            mgmt_ip="STATIC_FILE",
+            vendor=vendor,
+            mgmt_ip=mgmt_ip,
             raw_text=text,
         )
         d.vlans = _parse_vlans(text)
@@ -148,30 +246,27 @@ def parse_configs_fallback(paths: List[str]) -> TopologyData:
 
         topo.devices[hostname] = d
 
-    # Minimal auto-links (placeholder) so topology view isn’t empty:
+    # Placeholder links (until real adjacency parsing)
     names = list(topo.devices.keys())
     for i in range(len(names) - 1):
         topo.links.append(Link(a=names[i], b=names[i + 1], label="Auto", kind="L2"))
+
     return topo
 
 
 def parse_configs(paths: List[str]) -> TopologyData:
     """
     Tries your real parser if present; otherwise uses the fallback parser above.
-    Expected (optional) integration:
-      - parser.orchestrator.parse_configs(paths) -> TopologyData-like object
     """
     try:
         from parser.orchestrator import parse_configs as real_parse  # type: ignore
         parsed = real_parse(paths)
-        # If your orchestrator returns your own models, adapt here.
-        # For now, assume it returns something compatible or already TopologyData.
         if isinstance(parsed, TopologyData):
             return parsed
-        # Best-effort adaptation:
+
+        # Best-effort adaptation if orchestrator returns different objects
         topo = TopologyData()
-        # devices
-        for dev in getattr(parsed, "devices", []):
+        for dev in getattr(parsed, "devices", []) or []:
             hostname = getattr(dev, "hostname", "—")
             d = DeviceSummary(
                 hostname=hostname,
@@ -183,19 +278,12 @@ def parse_configs(paths: List[str]) -> TopologyData:
                 mlag=getattr(dev, "mlag", "—"),
                 raw_text=getattr(dev, "raw_text", "") or "",
             )
-            # VLANs
             for v in getattr(dev, "vlans", []) or []:
-                topo.devices[hostname] = topo.devices.get(hostname, d)
-                topo.devices[hostname].vlans.append(VlanInfo(str(getattr(v, "vid", "")), str(getattr(v, "name", ""))))
-            # L3 interfaces
+                d.vlans.append(VlanInfo(str(getattr(v, "vid", "")), str(getattr(v, "name", ""))))
             for i in getattr(dev, "l3_interfaces", []) or []:
-                topo.devices[hostname] = topo.devices.get(hostname, d)
-                topo.devices[hostname].l3_interfaces.append(
-                    InterfaceIP(str(getattr(i, "name", "")), str(getattr(i, "ip", "")))
-                )
+                d.l3_interfaces.append(InterfaceIP(str(getattr(i, "name", "")), str(getattr(i, "ip", ""))))
             topo.devices[hostname] = d
 
-        # links
         for l in getattr(parsed, "links", []) or []:
             topo.links.append(
                 Link(
@@ -222,13 +310,12 @@ class FabricWeaverApp(ttk.Frame):
         self._topo: TopologyData = TopologyData()
         self._active_device: Optional[str] = None
         self._show_interface_labels = tk.BooleanVar(value=True)
-        self._show_vlan_ids = tk.BooleanVar(value=False)
+        self._show_vlan_ids = tk.BooleanVar(value=True)
         self._static_flow_labels = tk.BooleanVar(value=True)
 
         self._build_shell()
         self._build_tabs()
         self._build_statusbar()
-
         self._set_status("Ready")
 
     # ---- Shell / Tabs ----
@@ -237,12 +324,11 @@ class FabricWeaverApp(ttk.Frame):
         self.configure(style="TFrame")
         self.pack(fill="both", expand=True)
 
-        # Top header strip
         header = ttk.Frame(self, style="Panel.TFrame")
         header.pack(fill="x", padx=10, pady=(10, 0))
 
         title = ttk.Label(header, text="FabricWeaver", style="Header.TLabel")
-        title.pack(side="left", padx=(12, 10), pady=10)
+        title.pack(side="left", padx=(12, 12), pady=10)
 
         self.scan_state = ttk.Label(header, text="●  Loaded: 0", style="Panel.TLabel")
         self.scan_state.pack(side="left", padx=8)
@@ -282,7 +368,6 @@ class FabricWeaverApp(ttk.Frame):
     def _build_devices_tab(self) -> None:
         root = self.tab_devices
 
-        # Top controls row
         top = ttk.Frame(root, style="TFrame")
         top.pack(fill="x", pady=(0, 10))
 
@@ -290,17 +375,20 @@ class FabricWeaverApp(ttk.Frame):
         ttk.Button(top, text="Export", command=self._export_placeholder).pack(side="left", padx=8)
         ttk.Button(top, text="Clear", command=self._clear_all).pack(side="left", padx=8)
 
-        # Main split: left list / right detail
         body = ttk.Frame(root, style="TFrame")
         body.pack(fill="both", expand=True)
 
+        # Left panel (device list)
         left = ttk.Frame(body, style="Panel.TFrame")
         left.pack(side="left", fill="y", padx=(0, 10))
 
         ttk.Label(left, text="Devices", style="Header.TLabel").pack(anchor="w", padx=12, pady=(10, 8))
 
+        list_frame = ttk.Frame(left, style="Panel.TFrame")
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
         self.device_list = tk.Listbox(
-            left,
+            list_frame,
             bg=self.colors.panel,
             fg=self.colors.text,
             highlightthickness=1,
@@ -311,26 +399,37 @@ class FabricWeaverApp(ttk.Frame):
             width=22,
             height=22,
         )
-        self.device_list.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.device_list.yview)
+        self.device_list.configure(yscrollcommand=sb.set)
+        self.device_list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
         self.device_list.bind("<<ListboxSelect>>", self._on_device_select)
 
+        # Right panel (summary)
         right = ttk.Frame(body, style="Panel.TFrame")
         right.pack(side="left", fill="both", expand=True)
 
         self.detail_title = ttk.Label(right, text="FABRICWEAVER — SUMMARY VIEW (UI v2)", style="Header.TLabel")
         self.detail_title.pack(anchor="w", padx=12, pady=(10, 8))
 
+        text_frame = ttk.Frame(right, style="Panel.TFrame")
+        text_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
         self.detail_text = tk.Text(
-            right,
+            text_frame,
             bg=self.colors.panel,
             fg=self.colors.text,
             insertbackground=self.colors.text,
             relief="flat",
             highlightthickness=1,
             highlightbackground=self.colors.border,
-            wrap="word",
+            wrap="none",
+            font=("Consolas", 10),
         )
-        self.detail_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        sb2 = ttk.Scrollbar(text_frame, orient="vertical", command=self.detail_text.yview)
+        self.detail_text.configure(yscrollcommand=sb2.set)
+        self.detail_text.pack(side="left", fill="both", expand=True)
+        sb2.pack(side="right", fill="y")
         self.detail_text.config(state="disabled")
 
     def _render_device_summary(self, d: DeviceSummary) -> str:
@@ -340,26 +439,28 @@ class FabricWeaverApp(ttk.Frame):
         lines.append(f"Hostname : {d.hostname}")
         lines.append(f"Vendor   : {d.vendor}")
         lines.append(f"Mgmt IP  : {d.mgmt_ip}")
-        lines.append(f"Model    : {d.model}")
-        lines.append(f"OS Ver   : {d.os_ver}")
-        lines.append(f"vPC Role : {d.vpc_role}")
-        lines.append(f"MLAG     : {d.mlag}")
+        if d.model != "—":
+            lines.append(f"Model    : {d.model}")
+        if d.os_ver != "—":
+            lines.append(f"OS Ver   : {d.os_ver}")
+        if d.vpc_role != "—":
+            lines.append(f"vPC Role : {d.vpc_role}")
+        if d.mlag != "—":
+            lines.append(f"MLAG     : {d.mlag}")
+
         lines.append("")
         lines.append("L2: VLANs")
         if d.vlans:
-            for v in d.vlans[:40]:
-                if self._show_vlan_ids.get():
-                    lines.append(f"VLAN {v.vid:<5}  name: {v.name}")
-                else:
-                    lines.append(f"VLAN {v.vid:<5}  name: {v.name}")
+            for v in d.vlans[:120]:
+                lines.append(f"VLAN {v.vid:<5}  name: {v.name}")
         else:
             lines.append("—")
 
         lines.append("")
         lines.append("L3: Interfaces (with IP)")
         if d.l3_interfaces:
-            for i in d.l3_interfaces[:40]:
-                lines.append(f"{i.name:<14} {i.ip}")
+            for i in d.l3_interfaces[:120]:
+                lines.append(f"{i.name:<18} {i.ip}")
         else:
             lines.append("—")
 
@@ -382,10 +483,7 @@ class FabricWeaverApp(ttk.Frame):
         self.detail_text.insert("1.0", self._render_device_summary(d))
         self.detail_text.config(state="disabled")
 
-        # Sync raw tab view
         self._render_raw(d)
-
-        # Refresh topology highlights
         self._draw_topology()
 
     # ---- Topology tab ----
@@ -423,7 +521,6 @@ class FabricWeaverApp(ttk.Frame):
             relief="flat",
         )
         self.topo_canvas.pack(fill="both", expand=True, padx=12, pady=12)
-
         self.topo_canvas.bind("<Configure>", lambda e: self._draw_topology())
 
     def _draw_topology(self) -> None:
@@ -445,15 +542,14 @@ class FabricWeaverApp(ttk.Frame):
         names = list(self._topo.devices.keys())
         n = len(names)
 
-        # Simple ring layout (clean + predictable)
         cx, cy = w // 2, h // 2
         r = int(min(w, h) * 0.32)
 
         pos: Dict[str, Tuple[int, int]] = {}
         for i, name in enumerate(names):
-            angle = (i / max(1, n)) * 6.283185307179586
-            x = int(cx + r * (0.95 * (tk.math.cos(angle) if hasattr(tk, "math") else __import__("math").cos(angle))))
-            y = int(cy + r * (0.95 * (tk.math.sin(angle) if hasattr(tk, "math") else __import__("math").sin(angle))))
+            angle = (i / max(1, n)) * 2.0 * math.pi
+            x = int(cx + r * 0.95 * math.cos(angle))
+            y = int(cy + r * 0.95 * math.sin(angle))
             pos[name] = (x, y)
 
         # Links
@@ -465,7 +561,6 @@ class FabricWeaverApp(ttk.Frame):
 
             color = self.colors.l2 if link.kind.upper() == "L2" else self.colors.l3
             width = 3 if link.kind.upper() == "L2" else 2
-
             c.create_line(ax, ay, bx, by, fill=color, width=width)
 
             if self._static_flow_labels.get() and link.label:
@@ -477,7 +572,7 @@ class FabricWeaverApp(ttk.Frame):
             x, y = pos[name]
             is_active = (name == self._active_device)
 
-            node_w, node_h = 92, 54
+            node_w, node_h = 110, 56
             x0, y0 = x - node_w // 2, y - node_h // 2
             x1, y1 = x + node_w // 2, y + node_h // 2
 
@@ -508,8 +603,11 @@ class FabricWeaverApp(ttk.Frame):
         self.raw_title = ttk.Label(body, text="Raw Config — (select a device)", style="Header.TLabel")
         self.raw_title.pack(anchor="w", padx=12, pady=(10, 8))
 
+        text_frame = ttk.Frame(body, style="Panel.TFrame")
+        text_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
         self.raw_text = tk.Text(
-            body,
+            text_frame,
             bg=self.colors.panel,
             fg=self.colors.text,
             insertbackground=self.colors.text,
@@ -517,8 +615,12 @@ class FabricWeaverApp(ttk.Frame):
             highlightthickness=1,
             highlightbackground=self.colors.border,
             wrap="none",
+            font=("Consolas", 10),
         )
-        self.raw_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        sb = ttk.Scrollbar(text_frame, orient="vertical", command=self.raw_text.yview)
+        self.raw_text.configure(yscrollcommand=sb.set)
+        self.raw_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
         self.raw_text.config(state="disabled")
 
     def _render_raw(self, d: DeviceSummary) -> None:
@@ -558,7 +660,6 @@ class FabricWeaverApp(ttk.Frame):
         nb.add(tab_ssh, text="SSH / CLI")
         nb.add(tab_export, text="Export")
 
-        # General
         ttk.Label(tab_general, text="General", style="Header.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
 
         frame_checks = ttk.Frame(tab_general, style="Panel.TFrame")
@@ -579,19 +680,12 @@ class FabricWeaverApp(ttk.Frame):
         ttk.Checkbutton(display, text="Show VLAN IDs", variable=self._show_vlan_ids, command=self._refresh_active_detail).pack(anchor="w", pady=4)
         ttk.Checkbutton(display, text="Enable Static Flow Labels", variable=self._static_flow_labels, command=self._draw_topology).pack(anchor="w", pady=4)
 
-        # SSH tab placeholder
         ttk.Label(tab_ssh, text="SSH Mode", style="Header.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
-        ttk.Label(tab_ssh, text="(Hook this into ssh/live_collect.py when you’re ready)", style="Panel.TLabel").pack(
-            anchor="w", padx=12, pady=(0, 12)
-        )
+        ttk.Label(tab_ssh, text="(Hook this into ssh/live_collect.py when you’re ready)", style="Panel.TLabel").pack(anchor="w", padx=12, pady=(0, 12))
 
-        # Export tab placeholder
         ttk.Label(tab_export, text="Export", style="Header.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
-        ttk.Label(tab_export, text="(Hook this into core/exporter.py for PNG/PDF export)", style="Panel.TLabel").pack(
-            anchor="w", padx=12, pady=(0, 12)
-        )
+        ttk.Label(tab_export, text="(Hook this into core/exporter.py for PNG/PDF export)", style="Panel.TLabel").pack(anchor="w", padx=12, pady=(0, 12))
 
-        # Buttons
         btns = ttk.Frame(win, style="TFrame")
         btns.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(btns, text="Save", style="Primary.TButton", command=win.destroy).pack(side="right", padx=(8, 0))
