@@ -781,13 +781,17 @@ def _infer_vpc_pairs(topo: TopologyData) -> List[PairInference]:
 
     # Precompute IPs per device: mgmt + all interface IPs
     ips: Dict[str, Set[str]] = {}
+    ip_to_iface: Dict[str, Tuple[str, str]] = {}
     for hn, d in devs.items():
         s = set()
         if d.mgmt_ip and d.mgmt_ip != "—":
             s.add(d.mgmt_ip)
-        for iface in d.interfaces.values():
+            ip_to_iface[d.mgmt_ip] = (hn, "mgmt")
+        for ifname, iface in d.interfaces.items():
             if iface.ip:
-                s.add(iface.ip.split("/", 1)[0])
+                ipaddr = iface.ip.split("/", 1)[0]
+                s.add(ipaddr)
+                ip_to_iface[ipaddr] = (hn, ifname)
         ips[hn] = s
 
     considered = set()
@@ -806,10 +810,20 @@ def _infer_vpc_pairs(topo: TopologyData) -> List[PairInference]:
             reasons: List[str] = []
             confidence = "low"
 
-            # keepalive match
-            if da.vpc_keepalive_dst in ips.get(b, set()):
-                reasons.append(f"Keepalive dest {da.vpc_keepalive_dst} matches {b} mgmt/SVI IP")
-                confidence = "high"
+            # keepalive match: be explicit whether it matches mgmt or a particular interface (SVI)
+            if da.vpc_keepalive_dst and da.vpc_keepalive_dst in ips.get(b, set()):
+                target = ip_to_iface.get(da.vpc_keepalive_dst)
+                if target and target[0] == b:
+                    if target[1] == "mgmt":
+                        reasons.append(f"Keepalive dest {da.vpc_keepalive_dst} matches {b} mgmt IP")
+                    else:
+                        # indicate the interface name and if it's an SVI
+                        iface_obj = devs[b].interfaces.get(target[1])
+                        if iface_obj and iface_obj.is_svi:
+                            reasons.append(f"Keepalive dest {da.vpc_keepalive_dst} matches {b} SVI {target[1]}")
+                        else:
+                            reasons.append(f"Keepalive dest {da.vpc_keepalive_dst} matches {b} interface {target[1]}")
+                    confidence = "high"
 
             # domain match
             if da.vpc_domain and db.vpc_domain and da.vpc_domain == db.vpc_domain:
@@ -1323,28 +1337,40 @@ class FabricWeaverApp(ttk.Frame):
     # ---------------- UI build ----------------
 
     def _build_layout(self):
-        # main 3-column grid
-        self.columnconfigure(0, weight=0)  # sidebar
-        self.columnconfigure(1, weight=1)  # main
-        self.columnconfigure(2, weight=0)  # inspector
+        # Use a resizable PanedWindow so panes (sidebar / main / inspector) can be adjusted by the user.
+        # Left: sidebar, Center: a nested PanedWindow with main + inspector (inspector will be added/removed
+        # depending on active tab to keep the inspector visible only on the Topology tab).
         self.rowconfigure(0, weight=1)
 
-        self.sidebar = ttk.Frame(self, style="Panel.TFrame", width=260)
-        self.sidebar.grid(row=0, column=0, sticky="nsw", padx=(10, 6), pady=10)
-        self.sidebar.grid_propagate(False)
+        self.paned = tk.PanedWindow(self, orient="horizontal", sashrelief="raised", bg=self.colors.bg)
+        self.paned.pack(fill="both", expand=True)
 
-        self.main = ttk.Frame(self, style="TFrame")
-        self.main.grid(row=0, column=1, sticky="nsew", padx=6, pady=10)
+        # Sidebar
+        self.sidebar = ttk.Frame(self.paned, style="Panel.TFrame", width=280)
+        self.sidebar.pack_propagate(False)
+        self.paned.add(self.sidebar, minsize=120)
+
+        # Center area: nested PanedWindow to hold main and (optionally) inspector
+        self.center_paned = tk.PanedWindow(self.paned, orient="horizontal", sashrelief="raised", bg=self.colors.bg)
+        self.paned.add(self.center_paned, minsize=400)
+
+        # Main (notebook)
+        self.main = ttk.Frame(self.center_paned, style="TFrame")
         self.main.rowconfigure(0, weight=1)
         self.main.columnconfigure(0, weight=1)
+        self.center_paned.add(self.main)
 
-        self.inspector = ttk.Frame(self, style="Panel.TFrame", width=320)
-        self.inspector.grid(row=0, column=2, sticky="nse", padx=(6, 10), pady=10)
-        self.inspector.grid_propagate(False)
+        # Inspector frame (created but not added to paned until Topology tab active)
+        self.inspector = ttk.Frame(self.center_paned, style="Panel.TFrame", width=360)
+        self.inspector.pack_propagate(False)
 
+        # Build UI pieces
         self._build_sidebar()
         self._build_main()
         self._build_inspector()
+
+        # Notebook tab change handler: show inspector only on Topology tab
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_sidebar(self):
         # Small title (no top banner)
@@ -1428,6 +1454,26 @@ class FabricWeaverApp(ttk.Frame):
         self.ins_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.ins_text.configure(state="disabled")
 
+    def _on_tab_changed(self, _evt=None):
+        try:
+            sel = self.nb.select()
+            # Compare widget ids; self.tab_topology is the frame associated with topology
+            if sel == str(self.tab_topology):
+                # ensure inspector is present in center_paned
+                panes = self.center_paned.panes()
+                if str(self.inspector) not in panes:
+                    self.center_paned.add(self.inspector, minsize=200)
+            else:
+                # remove inspector pane if present
+                try:
+                    panes = self.center_paned.panes()
+                    if str(self.inspector) in panes:
+                        self.center_paned.forget(self.inspector)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _build_details_tab(self):
         self.details_scroll = ScrollableFrame(self.tab_details, self.colors, panel_style="Panel.TFrame")
         self.details_scroll.pack(fill="both", expand=True, padx=6, pady=6)
@@ -1495,6 +1541,11 @@ class FabricWeaverApp(ttk.Frame):
         self.raw_text.grid(row=1, column=0, sticky="nsew", padx=(10, 6), pady=(0, 10))
         self.raw_text.configure(state="disabled")
 
+        # horizontal scrollbar for raw text
+        self.raw_xscroll = ttk.Scrollbar(self.tab_raw, orient="horizontal", command=self.raw_text.xview)
+        self.raw_xscroll.grid(row=2, column=0, sticky="ew", padx=(10, 6))
+        self.raw_text.configure(xscrollcommand=self.raw_xscroll.set)
+
         self.json_text = tk.Text(
             self.tab_raw,
             bg=self.colors.panel,
@@ -1507,6 +1558,11 @@ class FabricWeaverApp(ttk.Frame):
         )
         self.json_text.grid(row=1, column=1, sticky="nsew", padx=(6, 10), pady=(0, 10))
         self.json_text.configure(state="disabled")
+
+        # horizontal scrollbar for json text
+        self.json_xscroll = ttk.Scrollbar(self.tab_raw, orient="horizontal", command=self.json_text.xview)
+        self.json_xscroll.grid(row=2, column=1, sticky="ew", padx=(6, 10))
+        self.json_text.configure(xscrollcommand=self.json_xscroll.set)
 
     # ---------------- Section builders ----------------
 
@@ -1699,6 +1755,7 @@ class FabricWeaverApp(ttk.Frame):
         ttk.Label(box, text="Export options", style="Header.TLabel").pack(anchor="w", pady=(0, 10))
         ttk.Button(box, text="Export Topology JSON", style="Primary.TButton", command=lambda: (win.destroy(), self.export_json())).pack(fill="x", pady=(0, 8))
         ttk.Button(box, text="Export Topology PNG", command=lambda: (win.destroy(), self.export_png())).pack(fill="x", pady=(0, 8))
+        ttk.Button(box, text="Export Topology PDF", command=lambda: (win.destroy(), self.export_pdf())).pack(fill="x", pady=(0, 8))
         ttk.Button(box, text="Export Summary TXT", command=lambda: (win.destroy(), self.export_summary_txt())).pack(fill="x")
 
         ttk.Button(box, text="Close", command=win.destroy).pack(anchor="e", pady=(12, 0))
@@ -1797,6 +1854,43 @@ class FabricWeaverApp(ttk.Frame):
             messagebox.showinfo(
                 "Export",
                 "Exported PostScript successfully, but PNG conversion requires Pillow.\n\n"
+                f"Saved:\n{ps_path}\n\nInstall Pillow:\n  pip install pillow"
+            )
+
+    def export_pdf(self):
+        if not self._topo.devices:
+            messagebox.showwarning("Export", "Nothing loaded.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            title="Export topology PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")]
+        )
+        if not save_path:
+            return
+
+        ps_path = save_path[:-4] + ".ps"
+        try:
+            self.canvas.postscript(file=ps_path, colormode="color")
+        except Exception as e:
+            messagebox.showerror("Export", f"Failed to export PostScript:\n{e}")
+            return
+
+        try:
+            from PIL import Image  # type: ignore
+            img = Image.open(ps_path)
+            # Convert and save as PDF
+            img.convert("RGB").save(save_path, "PDF")
+            try:
+                os.remove(ps_path)
+            except Exception:
+                pass
+            messagebox.showinfo("Export", f"Exported:\n{save_path}")
+        except Exception:
+            messagebox.showinfo(
+                "Export",
+                "Exported PostScript successfully, but PDF conversion requires Pillow.\n\n"
                 f"Saved:\n{ps_path}\n\nInstall Pillow:\n  pip install pillow"
             )
 
