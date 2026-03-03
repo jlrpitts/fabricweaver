@@ -101,10 +101,12 @@ def _apply_dark_theme_fallback(root: tk.Misc, base: Optional[ThemeColors] = None
 
         style.configure("TSeparator", background=c.border)
 
-        # Checkbutton / Toggle visibility styling
+        # Checkbutton / Toggle visibility styling - orange accent when checked
         try:
             style.configure("Toggle.TCheckbutton", background=c.panel, foreground=c.text)
-            style.map("Toggle.TCheckbutton", background=[("active", c.panel)])
+            style.map("Toggle.TCheckbutton",
+                      background=[("active", c.accent), ("selected", c.accent)],
+                      foreground=[("active", "#111111"), ("selected", "#111111")])
         except Exception:
             pass
 
@@ -227,6 +229,7 @@ class DeviceSummary:
 
     vrfs: Dict[str, List[str]] = field(default_factory=dict)
     routing_protocols: List[str] = field(default_factory=list)
+    bgp_asn: str = ""  # Extracted from "router bgp ASN"
     static_routes: List[RouteInfo] = field(default_factory=list)
     fhrp: List[FhrpGroup] = field(default_factory=list)
 
@@ -598,8 +601,7 @@ def _parse_routing_and_routes(d: DeviceSummary, text: str) -> None:
 
     d.routing_protocols = sorted(prots)
     if bgp_asn:
-        # tuck ASN into os_ver field? no. We'll keep as a "Protocol tag" in summary later.
-        pass
+        d.bgp_asn = bgp_asn
 
     routes: List[RouteInfo] = []
     for m in IP_ROUTE_CIDR_RE.finditer(text):
@@ -1342,18 +1344,28 @@ class FabricWeaverApp(ttk.Frame):
         self.var_show_labels = tk.BooleanVar(value=True)
 
         # ensure changes to these variables always redraw topology
+        # Debounce rapid changes to avoid excessive redraws
+        self._toggle_timer = None
+        def _on_toggle(*args):
+            if self._toggle_timer:
+                try:
+                    self.after_cancel(self._toggle_timer)
+                except (tk.TclError, AttributeError):
+                    pass
+            self._toggle_timer = self.after(50, self.draw_topology)
+
         try:
-            self.var_show_l2.trace_add("write", lambda *a: self.draw_topology())
-            self.var_show_l3.trace_add("write", lambda *a: self.draw_topology())
-            self.var_show_medium.trace_add("write", lambda *a: self.draw_topology())
-            self.var_show_labels.trace_add("write", lambda *a: self.draw_topology())
+            self.var_show_l2.trace_add("write", _on_toggle)
+            self.var_show_l3.trace_add("write", _on_toggle)
+            self.var_show_medium.trace_add("write", _on_toggle)
+            self.var_show_labels.trace_add("write", _on_toggle)
         except Exception:
             try:
                 # older tkinter
-                self.var_show_l2.trace("w", lambda *a: self.draw_topology())
-                self.var_show_l3.trace("w", lambda *a: self.draw_topology())
-                self.var_show_medium.trace("w", lambda *a: self.draw_topology())
-                self.var_show_labels.trace("w", lambda *a: self.draw_topology())
+                self.var_show_l2.trace("w", _on_toggle)
+                self.var_show_l3.trace("w", _on_toggle)
+                self.var_show_medium.trace("w", _on_toggle)
+                self.var_show_labels.trace("w", _on_toggle)
             except Exception:
                 pass
 
@@ -2182,7 +2194,7 @@ class FabricWeaverApp(ttk.Frame):
                 routed += 1
 
         peer_pos = [pc for pc in d.port_channels.values() if pc.is_peer_link]
-        return "\n".join([
+        lines = [
             "Layer 2 Summary",
             f"  VLANs         : {len(d.vlans)}",
             f"  Port-channels : {len(d.port_channels)}",
@@ -2191,7 +2203,16 @@ class FabricWeaverApp(ttk.Frame):
             f"  Routed ports  : {routed}",
             f"  STP           : {d.stp_mode or '—'}  priority {d.stp_priority or '—'}",
             f"  Peer-link Po  : {peer_pos[0].name if peer_pos else (d.vpc_peerlink_po or '—')}",
-        ])
+        ]
+        # Add clustering info
+        if d.vpc_configured:
+            lines.append(f"  vPC domain    : {d.vpc_domain or '—'}")
+            lines.append(f"  vPC keepalive : {d.vpc_keepalive_dst or '—'}")
+        if d.vlt_domain:
+            lines.append(f"  VLT domain    : {d.vlt_domain}")
+        if d.mlag_domain:
+            lines.append(f"  MLAG domain   : {d.mlag_domain}")
+        return "\n".join(lines)
 
     def _l3_block(self, d: DeviceSummary) -> str:
         ip_count = 0
@@ -2203,14 +2224,24 @@ class FabricWeaverApp(ttk.Frame):
                 svi_count += 1
 
         vrfs = sorted(d.vrfs.keys()) if d.vrfs else ["default"]
-        return "\n".join([
+        # Count BGP neighbors from topology links
+        bgp_neighbors = 0
+        for link in self._topo.links:
+            if link.kind == "L3" and (link.a == d.hostname or link.b == d.hostname):
+                if link.evidence in ("ip-subnet", "external"):
+                    bgp_neighbors += 1
+        
+        lines = [
             "Layer 3 Summary",
             f"  IP interfaces : {ip_count}",
             f"  SVIs          : {svi_count}",
             f"  VRFs          : {', '.join(vrfs)}",
             f"  Routing protos: {', '.join(d.routing_protocols) if d.routing_protocols else '—'}",
             f"  Static routes : {len(d.static_routes)}",
-        ])
+            f"  BGP neighbors : {bgp_neighbors}",
+            f"  CDP neighbors : {len(d.cdp)}",
+        ]
+        return "\n".join(lines)
 
     # ---------------- Raw copy ----------------
 
@@ -2241,9 +2272,10 @@ class FabricWeaverApp(ttk.Frame):
         w = max(700, self.canvas.winfo_width() if hasattr(self, "canvas") else 900)
         names = sorted(self._topo.devices.keys())
 
-        cols = max(2, int(w / 220))
-        x0, y0 = 160, 120
-        dx, dy = 220, 140
+        # Larger spacing for larger nodes (420x200)
+        cols = max(1, int(w / 480))
+        x0, y0 = 280, 180
+        dx, dy = 480, 260
         for idx, name in enumerate(names):
             if name in self._node_pos:
                 continue
@@ -2252,6 +2284,55 @@ class FabricWeaverApp(ttk.Frame):
             self._node_pos[name] = (x0 + c * dx, y0 + r * dy)
 
         self.draw_topology()
+
+    def _format_node_info(self, d: DeviceSummary) -> List[str]:
+        """Format device info for display inside topology node."""
+        lines = []
+        
+        # Header: hostname + vendor/model/os
+        lines.append(d.hostname)
+        model_str = f"{d.vendor} {d.model}" if d.model != "—" else d.vendor
+        lines.append(f"{model_str} | {d.os_ver}")
+        
+        # Redundancy section if applicable
+        if d.vpc_configured:
+            lines.append(f"vPC domain {d.vpc_domain} (peer-link {d.vpc_peerlink_po or '—'})")
+        elif d.vlt_domain:
+            lines.append(f"VLT domain {d.vlt_domain}")
+        elif d.mlag_domain:
+            lines.append(f"MLAG domain {d.mlag_domain}")
+        
+        # L2 summary
+        trunks = sum(1 for i in d.interfaces.values() if i.mode == "trunk")
+        access = sum(1 for i in d.interfaces.values() if i.mode == "access")
+        svi_count = sum(1 for i in d.interfaces.values() if i.is_svi and i.ip)
+        
+        lines.append(f"L2: {len(d.vlans)} VLANs | {trunks} Trunks | {access} Access | {len(d.port_channels)} PCs")
+        
+        # L3 summary
+        vrf_count = len(d.vrfs) if d.vrfs else 1
+        bgp_asn = d.bgp_asn or "—"
+        bgp_neighbors = 0
+        
+        # Count BGP neighbors from topology links
+        for link in self._topo.links:
+            if link.kind == "L3" and (link.a == d.hostname or link.b == d.hostname):
+                bgp_neighbors += 1
+        
+        lines.append(f"L3: {svi_count} SVIs | {vrf_count} VRFs | BGP {bgp_asn} ({bgp_neighbors} peers)")
+        
+        # Topology connections summary
+        neighbors = set()
+        for link in self._topo.links:
+            if link.a == d.hostname:
+                neighbors.add(link.b)
+            elif link.b == d.hostname:
+                neighbors.add(link.a)
+        
+        if neighbors:
+            lines.append(f"Connected to: {', '.join(sorted(neighbors))}")
+        
+        return lines
 
     def draw_topology(self):
         if not hasattr(self, "canvas"):
@@ -2293,24 +2374,43 @@ class FabricWeaverApp(ttk.Frame):
 
             if self.var_show_labels.get():
                 mx, my = (ax + bx) // 2, (ay + by) // 2
-                c.create_text(mx, my - 10, text=link.label, fill=self.colors.muted, font=("Segoe UI", 9))
+                # Show link evidence: format is "label (evidence:confidence)"
+                label_text = f"{link.label} ({link.evidence})"
+                c.create_text(mx, my - 10, text=label_text, fill=self.colors.muted, font=("Segoe UI", 8))
 
-        # nodes
+        # nodes with embedded detail information
         for name in sorted(self._topo.devices.keys()):
+            d = self._topo.devices[name]
             x, y = self._node_pos.get(name, (180, 140))
             is_active = (name == self._active_device)
 
-            node_w, node_h = 170, 70
+            # Larger node to accommodate detail
+            node_w, node_h = 420, 200
             x0, y0 = x - node_w // 2, y - node_h // 2
             x1, y1 = x + node_w // 2, y + node_h // 2
 
             fill = "#1b2232" if not is_active else "#223050"
-            outline = self.colors.border if not is_active else self.colors.accent2
+            outline = self.colors.border if not is_active else self.colors.accent
+            line_width = 2 if not is_active else 3
 
             tag = f"node:{name}"
-            c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline, width=2, tags=(tag,))
-            c.create_text(x, y - 10, text=name, fill=self.colors.text, font=("Segoe UI", 10, "bold"), tags=(tag,))
-            c.create_text(x, y + 12, text=self._topo.devices[name].vendor, fill=self.colors.muted, font=("Segoe UI", 8), tags=(tag,))
+            c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline, width=line_width, tags=(tag,))
+
+            # Format and draw multi-line node info
+            info_lines = self._format_node_info(d)
+            line_height = 14
+            start_y = y0 + 10
+            
+            for idx, line in enumerate(info_lines):
+                y_pos = start_y + (idx * line_height)
+                if y_pos > y1 - 10:
+                    break
+                # Use smaller font for compact display
+                font_size = 9 if idx == 0 else 8  # Larger for hostname
+                font_weight = "bold" if idx == 0 else "normal"
+                text_color = self.colors.text if idx == 0 else self.colors.muted
+                c.create_text(x0 + 8, y_pos, anchor="nw", text=line, fill=text_color, 
+                             font=("Segoe UI", font_size, font_weight), tags=(tag,), width=node_w - 16)
 
     def _hit_test_node(self, x: int, y: int) -> Optional[str]:
         items = self.canvas.find_overlapping(x, y, x, y)
@@ -2342,6 +2442,8 @@ class FabricWeaverApp(ttk.Frame):
 
     def _on_canvas_up(self, _evt):
         self._dragging = None
+
+
 
     # ---------------- small helpers ----------------
 
