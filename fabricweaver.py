@@ -67,6 +67,12 @@ def _apply_dark_theme_fallback(root: tk.Misc, base: Optional[ThemeColors] = None
         style.configure("TButton", padding=(10, 7), background=c.panel2, foreground=c.text)
         style.map("TButton", background=[("active", c.border), ("pressed", c.border)])
 
+        # Accent button style for important actions (keeps consistent highlight)
+        style.configure("Accent.TButton", padding=(8, 6), background=c.accent, foreground="#111111")
+        style.map("Accent.TButton",
+              background=[("active", c.accent2), ("pressed", c.accent2)],
+              foreground=[("active", "#111111"), ("pressed", "#111111")])
+
         style.configure("Primary.TButton", padding=(10, 7), background=c.accent, foreground="#111111")
         style.map("Primary.TButton",
                   background=[("active", c.accent2), ("pressed", c.accent2)],
@@ -94,6 +100,13 @@ def _apply_dark_theme_fallback(root: tk.Misc, base: Optional[ThemeColors] = None
                   foreground=[("selected", c.text)])
 
         style.configure("TSeparator", background=c.border)
+
+        # Checkbutton / Toggle visibility styling
+        try:
+            style.configure("Toggle.TCheckbutton", background=c.panel, foreground=c.text)
+            style.map("Toggle.TCheckbutton", background=[("active", c.panel)])
+        except Exception:
+            pass
 
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.configure(bg=c.bg)
@@ -1328,6 +1341,22 @@ class FabricWeaverApp(ttk.Frame):
         self.var_show_medium = tk.BooleanVar(value=True)
         self.var_show_labels = tk.BooleanVar(value=True)
 
+        # ensure changes to these variables always redraw topology
+        try:
+            self.var_show_l2.trace_add("write", lambda *a: self.draw_topology())
+            self.var_show_l3.trace_add("write", lambda *a: self.draw_topology())
+            self.var_show_medium.trace_add("write", lambda *a: self.draw_topology())
+            self.var_show_labels.trace_add("write", lambda *a: self.draw_topology())
+        except Exception:
+            try:
+                # older tkinter
+                self.var_show_l2.trace("w", lambda *a: self.draw_topology())
+                self.var_show_l3.trace("w", lambda *a: self.draw_topology())
+                self.var_show_medium.trace("w", lambda *a: self.draw_topology())
+                self.var_show_labels.trace("w", lambda *a: self.draw_topology())
+            except Exception:
+                pass
+
         self._cached_detail_text: Dict[str, str] = {}
         self._cached_device_json: Dict[str, str] = {}
         self._cached_pair_text: Dict[str, str] = {}
@@ -1493,17 +1522,19 @@ class FabricWeaverApp(ttk.Frame):
         self.sec_pairing.toggle()
 
     def _build_topology_tab(self):
+        # Compact topology toolbar (no metrics area) — focused on topology interaction
         top = ttk.Frame(self.tab_topology, style="Panel.TFrame")
         top.pack(fill="x", padx=10, pady=(10, 6))
 
-        ttk.Button(top, text="Auto-layout", command=self.auto_layout).pack(side="left")
-        ttk.Button(top, text="Export PNG", command=self.export_png).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Auto-layout", style="Accent.TButton", command=self.auto_layout).pack(side="left")
+        ttk.Button(top, text="Export PNG", style="Accent.TButton", command=self.export_png).pack(side="left", padx=(6, 0))
 
-        ttk.Checkbutton(top, text="Show L2", variable=self.var_show_l2, command=self.draw_topology).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(top, text="Show L3", variable=self.var_show_l3, command=self.draw_topology).pack(side="left", padx=8)
-        ttk.Checkbutton(top, text="Show Medium", variable=self.var_show_medium, command=self.draw_topology).pack(side="left", padx=8)
-        ttk.Checkbutton(top, text="Edge Labels", variable=self.var_show_labels, command=self.draw_topology).pack(side="left", padx=8)
+        ttk.Checkbutton(top, text="Show L2", style="Toggle.TCheckbutton", variable=self.var_show_l2).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(top, text="Show L3", style="Toggle.TCheckbutton", variable=self.var_show_l3).pack(side="left", padx=8)
+        ttk.Checkbutton(top, text="Show Medium", style="Toggle.TCheckbutton", variable=self.var_show_medium).pack(side="left", padx=8)
+        ttk.Checkbutton(top, text="Edge Labels", style="Toggle.TCheckbutton", variable=self.var_show_labels).pack(side="left", padx=8)
 
+        # Topology canvas (main interactive area)
         self.canvas = tk.Canvas(
             self.tab_topology,
             bg=self.colors.panel2,
