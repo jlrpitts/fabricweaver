@@ -1342,6 +1342,14 @@ class FabricWeaverApp(ttk.Frame):
         self.var_show_l3 = tk.BooleanVar(value=True)
         self.var_show_medium = tk.BooleanVar(value=True)
         self.var_show_labels = tk.BooleanVar(value=True)
+        self.var_show_grid = tk.BooleanVar(value=False)
+
+        # Zoom and pan state
+        self.zoom_level = 1.0
+        self.zoom_min = 0.3
+        self.zoom_max = 3.0
+        self.pan_x = 0
+        self.pan_y = 0
 
         # ensure changes to these variables always redraw topology
         # Debounce rapid changes to avoid excessive redraws
@@ -1538,13 +1546,24 @@ class FabricWeaverApp(ttk.Frame):
         top = ttk.Frame(self.tab_topology, style="Panel.TFrame")
         top.pack(fill="x", padx=10, pady=(10, 6))
 
+        # Main action buttons
         ttk.Button(top, text="Auto-layout", style="Accent.TButton", command=self.auto_layout).pack(side="left")
         ttk.Button(top, text="Export PNG", style="Accent.TButton", command=self.export_png).pack(side="left", padx=(6, 0))
 
-        ttk.Checkbutton(top, text="Show L2", style="Toggle.TCheckbutton", variable=self.var_show_l2).pack(side="left", padx=(16, 0))
+        # Zoom controls
+        ttk.Label(top, text=" | ", style="Panel.TLabel").pack(side="left", padx=8)
+        ttk.Button(top, text="Zoom +", command=self._zoom_in).pack(side="left", padx=(0, 2))
+        ttk.Button(top, text="Zoom -", command=self._zoom_out).pack(side="left", padx=2)
+        ttk.Button(top, text="Reset", command=self._zoom_reset).pack(side="left", padx=(2, 6))
+        ttk.Button(top, text="Fit All", command=self._zoom_fit_all).pack(side="left", padx=2)
+
+        # Visibility toggles
+        ttk.Label(top, text=" | ", style="Panel.TLabel").pack(side="left", padx=8)
+        ttk.Checkbutton(top, text="Show L2", style="Toggle.TCheckbutton", variable=self.var_show_l2).pack(side="left")
         ttk.Checkbutton(top, text="Show L3", style="Toggle.TCheckbutton", variable=self.var_show_l3).pack(side="left", padx=8)
         ttk.Checkbutton(top, text="Show Medium", style="Toggle.TCheckbutton", variable=self.var_show_medium).pack(side="left", padx=8)
         ttk.Checkbutton(top, text="Edge Labels", style="Toggle.TCheckbutton", variable=self.var_show_labels).pack(side="left", padx=8)
+        ttk.Checkbutton(top, text="Grid", style="Toggle.TCheckbutton", variable=self.var_show_grid).pack(side="left", padx=8)
 
         # Topology canvas (main interactive area)
         self.canvas = tk.Canvas(
@@ -1560,6 +1579,9 @@ class FabricWeaverApp(ttk.Frame):
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_up)
         self.canvas.bind("<Configure>", lambda _e: self.draw_topology())
+        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.canvas.bind("<Button-4>", self._on_mouse_wheel)  # Linux scroll up
+        self.canvas.bind("<Button-5>", self._on_mouse_wheel)  # Linux scroll down
 
     def _build_raw_tab(self):
         self.tab_raw.columnconfigure(0, weight=1)
@@ -2285,6 +2307,206 @@ class FabricWeaverApp(ttk.Frame):
 
         self.draw_topology()
 
+    def _zoom_in(self):
+        """Increase zoom level."""
+        self.zoom_level = min(self.zoom_level * 1.2, self.zoom_max)
+        self.draw_topology()
+
+    def _zoom_out(self):
+        """Decrease zoom level."""
+        self.zoom_level = max(self.zoom_level / 1.2, self.zoom_min)
+        self.draw_topology()
+
+    def _zoom_reset(self):
+        """Reset zoom to 100% and pan to origin."""
+        self.zoom_level = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+        self.draw_topology()
+
+    def _zoom_fit_all(self):
+        """Auto-scale to fit all devices in view."""
+        if not self._topo.devices or not self._node_pos:
+            return
+        
+        # Get bounding box of all nodes
+        xs = [x for x, y in self._node_pos.values()]
+        ys = [y for x, y in self._node_pos.values()]
+        if not xs or not ys:
+            return
+        
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        # Add padding
+        padding = 100
+        min_x -= padding
+        max_x += padding
+        min_y -= padding
+        max_y += padding
+        
+        # Calculate zoom to fit
+        canvas_w = self.canvas.winfo_width() or 900
+        canvas_h = self.canvas.winfo_height() or 600
+        
+        bbox_w = max_x - min_x
+        bbox_h = max_y - min_y
+        
+        if bbox_w > 0 and bbox_h > 0:
+            zoom_x = (canvas_w * 0.8) / bbox_w
+            zoom_y = (canvas_h * 0.8) / bbox_h
+            self.zoom_level = min(zoom_x, zoom_y, self.zoom_max)
+            
+            # Center view on bbox
+            self.pan_x = (canvas_w / 2) - ((min_x + max_x) / 2) * self.zoom_level
+            self.pan_y = (canvas_h / 2) - ((min_y + max_y) / 2) * self.zoom_level
+        
+        self.draw_topology()
+
+    def _on_mouse_wheel(self, evt):
+        """Handle mouse wheel zoom (Ctrl required on some platforms)."""
+        # Get wheel delta
+        delta = 0
+        if evt.num == 5 or evt.delta < 0:
+            delta = -1  # scroll down / away
+        elif evt.num == 4 or evt.delta > 0:
+            delta = 1   # scroll up / toward
+        
+        if delta == 0:
+            return
+        
+        # Only zoom if Ctrl is pressed OR if it's a scroll event (num 4/5)
+        if evt.num in (4, 5) or (evt.state & 0x4):  # 0x4 is Ctrl mask
+            old_zoom = self.zoom_level
+            self.zoom_level *= (1.2 if delta > 0 else (1.0 / 1.2))
+            self.zoom_level = max(self.zoom_min, min(self.zoom_level, self.zoom_max))
+            
+            # Zoom centered on cursor
+            canvas_w = self.canvas.winfo_width() or 900
+            canvas_h = self.canvas.winfo_height() or 600
+            cursor_x = evt.x - self.pan_x
+            cursor_y = evt.y - self.pan_y
+            
+            # Adjust pan to keep cursor position fixed
+            zoom_ratio = self.zoom_level / old_zoom
+            self.pan_x = evt.x - cursor_x * zoom_ratio
+            self.pan_y = evt.y - cursor_y * zoom_ratio
+            
+            self.draw_topology()
+
+    def _draw_grid(self, canvas, xform):
+        """Draw subtle grid lines scaled with zoom."""
+        canvas_w = canvas.winfo_width() or 900
+        canvas_h = canvas.winfo_height() or 600
+        
+        grid_spacing = 100  # Base spacing in world units
+        grid_color = "#2a3038"  # Subtle dark color
+        
+        # Calculate grid density based on zoom
+        screen_spacing = grid_spacing * self.zoom_level
+        if screen_spacing < 10:
+            grid_spacing *= 5  # Skip more lines when zoomed out
+        elif screen_spacing > 100:
+            grid_spacing //= 2  # Add more lines when zoomed in
+        
+        # Draw vertical lines
+        x = -self.pan_x / self.zoom_level if self.zoom_level > 0 else 0
+        while x < canvas_w / self.zoom_level:
+            x_world = int(x)
+            if x_world % grid_spacing == 0:
+                x_screen, _ = xform(x_world, 0)
+                canvas.create_line(x_screen, 0, x_screen, canvas_h, fill=grid_color, dash=(2, 4))
+            x += 10
+        
+        # Draw horizontal lines
+        y = -self.pan_y / self.zoom_level if self.zoom_level > 0 else 0
+        while y < canvas_h / self.zoom_level:
+            y_world = int(y)
+            if y_world % grid_spacing == 0:
+                _, y_screen = xform(0, y_world)
+                canvas.create_line(0, y_screen, canvas_w, y_screen, fill=grid_color, dash=(2, 4))
+            y += 10
+
+    def _draw_edge_labels(self, canvas, link_labels):
+        """Draw edge labels with improved contrast and collision avoidance."""
+        if not link_labels:
+            return
+        
+        # Sort by position to process top-to-bottom, left-to-right
+        link_labels.sort(key=lambda l: (l["y1"] + l["y2"], l["x1"] + l["x2"]))
+        
+        used_regions = []  # Track label positions to avoid collisions
+        
+        for label_data in link_labels:
+            x1, y1 = label_data["x1"], label_data["y1"]
+            x2, y2 = label_data["x2"], label_data["y2"]
+            
+            # Mid-point of edge
+            mx = (x1 + x2) / 2
+            my = (y1 + y2) / 2
+            
+            # Perpendicular offset for readability
+            dx = x2 - x1
+            dy = y2 - y1
+            dist = (dx**2 + dy**2)**0.5
+            
+            if dist > 0:
+                # Unit perpendicular vector
+                perp_x = -dy / dist
+                perp_y = dx / dist
+                
+                # Try offsets: original, offset +, offset -
+                offsets = [0, 20, -20]
+                placed = False
+                
+                for offset in offsets:
+                    label_x = mx + perp_x * offset
+                    label_y = my + perp_y * offset
+                    
+                    # Check collision
+                    collision = False
+                    for region in used_regions:
+                        if abs(label_x - region[0]) < 80 and abs(label_y - region[1]) < 30:
+                            collision = True
+                            break
+                    
+                    if not collision:
+                        # Draw label with dark rounded background (simulated with rectangle)
+                        label_text = label_data["text"]
+                        
+                        # Create dark background
+                        canvas.create_rectangle(
+                            label_x - 60, label_y - 12,
+                            label_x + 60, label_y + 12,
+                            fill=self.colors.panel2, outline=self.colors.border, width=1
+                        )
+                        
+                        # Draw text with high contrast
+                        canvas.create_text(
+                            label_x, label_y,
+                            text=label_text, fill="#e8e3d7",
+                            font=("Segoe UI", 7, "bold"),
+                            justify="center"
+                        )
+                        
+                        used_regions.append((label_x, label_y))
+                        placed = True
+                        break
+                
+                # Fallback: just place it if no good location found
+                if not placed and link_labels.index(label_data) < 5:  # Only fallback for first few
+                    canvas.create_rectangle(
+                        mx - 60, my - 12,
+                        mx + 60, my + 12,
+                        fill=self.colors.panel2, outline=self.colors.border, width=1
+                    )
+                    canvas.create_text(
+                        mx, my,
+                        text=label_data["text"], fill="#e8e3d7",
+                        font=("Segoe UI", 7, "bold"),
+                        justify="center"
+                    )
+
     def _format_node_info(self, d: DeviceSummary) -> List[str]:
         """Format device info for display inside topology node."""
         lines = []
@@ -2351,7 +2573,17 @@ class FabricWeaverApp(ttk.Frame):
                 self.auto_layout()
                 break
 
-        # links
+        # Helper to transform coordinates with zoom and pan
+        def xform(x: int, y: int) -> tuple:
+            """Apply zoom and pan transformation."""
+            return (x * self.zoom_level + self.pan_x, y * self.zoom_level + self.pan_y)
+
+        # Draw grid if enabled
+        if self.var_show_grid.get():
+            self._draw_grid(c, xform)
+
+        # links with improved labels
+        link_labels = []  # Collect labels for post-processing
         for link in self._topo.links:
             if link.kind == "L2" and not self.var_show_l2.get():
                 continue
@@ -2366,17 +2598,30 @@ class FabricWeaverApp(ttk.Frame):
             ax, ay = self._node_pos[link.a]
             bx, by = self._node_pos[link.b]
 
+            # Transform endpoints
+            ax_zoom, ay_zoom = xform(ax, ay)
+            bx_zoom, by_zoom = xform(bx, by)
+
             color = self.colors.l2 if link.kind == "L2" else self.colors.l3
-            width = 3 if link.kind == "L2" else 2
+            width = max(1, int(3 * self.zoom_level)) if link.kind == "L2" else max(1, int(2 * self.zoom_level))
             dash = () if link.kind == "L2" else (6, 4)
 
-            c.create_line(ax, ay, bx, by, fill=color, width=width, dash=dash)
+            c.create_line(ax_zoom, ay_zoom, bx_zoom, by_zoom, fill=color, width=width, dash=dash)
 
             if self.var_show_labels.get():
-                mx, my = (ax + bx) // 2, (ay + by) // 2
-                # Show link evidence: format is "label (evidence:confidence)"
-                label_text = f"{link.label} ({link.evidence})"
-                c.create_text(mx, my - 10, text=label_text, fill=self.colors.muted, font=("Segoe UI", 8))
+                # Prepare label data (process later for collision avoidance)
+                label_text = f"{link.a}:{link.a_intf} ↔ {link.b}:{link.b_intf}\n({link.evidence})"
+                link_labels.append({
+                    "text": label_text,
+                    "x1": ax_zoom,
+                    "y1": ay_zoom,
+                    "x2": bx_zoom,
+                    "y2": by_zoom,
+                    "link": link
+                })
+        
+        # Draw edge labels with improved contrast
+        self._draw_edge_labels(c, link_labels)
 
         # nodes with embedded detail information
         for name in sorted(self._topo.devices.keys()):
@@ -2386,31 +2631,37 @@ class FabricWeaverApp(ttk.Frame):
 
             # Larger node to accommodate detail
             node_w, node_h = 420, 200
-            x0, y0 = x - node_w // 2, y - node_h // 2
-            x1, y1 = x + node_w // 2, y + node_h // 2
+            x0 = x - node_w // 2
+            y0 = y - node_h // 2
+            x1 = x + node_w // 2
+            y1 = y + node_h // 2
+
+            # Transform node corners
+            x0_zoom, y0_zoom = xform(x0, y0)
+            x1_zoom, y1_zoom = xform(x1, y1)
 
             fill = "#1b2232" if not is_active else "#223050"
             outline = self.colors.border if not is_active else self.colors.accent
-            line_width = 2 if not is_active else 3
+            line_width = max(1, int(2 * self.zoom_level)) if not is_active else max(1, int(3 * self.zoom_level))
 
             tag = f"node:{name}"
-            c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline, width=line_width, tags=(tag,))
+            c.create_rectangle(x0_zoom, y0_zoom, x1_zoom, y1_zoom, fill=fill, outline=outline, width=line_width, tags=(tag,))
 
             # Format and draw multi-line node info
             info_lines = self._format_node_info(d)
-            line_height = 14
-            start_y = y0 + 10
+            line_height = max(10, int(14 * self.zoom_level))
+            start_y = y0_zoom + max(5, int(10 * self.zoom_level))
             
             for idx, line in enumerate(info_lines):
                 y_pos = start_y + (idx * line_height)
-                if y_pos > y1 - 10:
+                if y_pos > y1_zoom - 10:
                     break
-                # Use smaller font for compact display
-                font_size = 9 if idx == 0 else 8  # Larger for hostname
+                # Use smaller font for compact display (scale with zoom)
+                font_size = max(7, int((9 if idx == 0 else 8) * (self.zoom_level ** 0.5)))
                 font_weight = "bold" if idx == 0 else "normal"
                 text_color = self.colors.text if idx == 0 else self.colors.muted
-                c.create_text(x0 + 8, y_pos, anchor="nw", text=line, fill=text_color, 
-                             font=("Segoe UI", font_size, font_weight), tags=(tag,), width=node_w - 16)
+                c.create_text(x0_zoom + max(5, int(8 * self.zoom_level)), y_pos, anchor="nw", text=line, fill=text_color,
+                             font=("Segoe UI", font_size, font_weight), tags=(tag,))
 
     def _hit_test_node(self, x: int, y: int) -> Optional[str]:
         items = self.canvas.find_overlapping(x, y, x, y)
@@ -2433,8 +2684,8 @@ class FabricWeaverApp(ttk.Frame):
     def _on_canvas_drag(self, evt):
         if not self._dragging:
             return
-        dx = evt.x - self._drag_start[0]
-        dy = evt.y - self._drag_start[1]
+        dx = (evt.x - self._drag_start[0]) / self.zoom_level if self.zoom_level > 0 else 0
+        dy = (evt.y - self._drag_start[1]) / self.zoom_level if self.zoom_level > 0 else 0
         x, y = self._node_pos.get(self._dragging, (evt.x, evt.y))
         self._node_pos[self._dragging] = (x + dx, y + dy)
         self._drag_start = (evt.x, evt.y)
