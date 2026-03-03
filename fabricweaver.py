@@ -1352,7 +1352,7 @@ class FabricWeaverApp(ttk.Frame):
         self.pan_y = 0
 
         # ensure changes to these variables always redraw topology
-        # Debounce rapid changes to avoid excessive redraws
+        # Debounce rapid changes to avoid excessive redraws (150ms for performance)
         self._toggle_timer = None
         def _on_toggle(*args):
             if self._toggle_timer:
@@ -1360,26 +1360,25 @@ class FabricWeaverApp(ttk.Frame):
                     self.after_cancel(self._toggle_timer)
                 except (tk.TclError, AttributeError):
                     pass
-            self._toggle_timer = self.after(50, self.draw_topology)
+            self._toggle_timer = self.after(150, self.draw_topology)
 
         try:
+            # Try modern trace_add first (Tk 8.6.11+)
             self.var_show_l2.trace_add("write", _on_toggle)
             self.var_show_l3.trace_add("write", _on_toggle)
             self.var_show_medium.trace_add("write", _on_toggle)
             self.var_show_labels.trace_add("write", _on_toggle)
-        except Exception:
-            try:
-                # older tkinter
-                self.var_show_l2.trace("w", _on_toggle)
-                self.var_show_l3.trace("w", _on_toggle)
-                self.var_show_medium.trace("w", _on_toggle)
-                self.var_show_labels.trace("w", _on_toggle)
-            except Exception:
-                pass
+        except AttributeError:
+            # Fall back to older trace method
+            self.var_show_l2.trace("w", _on_toggle)
+            self.var_show_l3.trace("w", _on_toggle)
+            self.var_show_medium.trace("w", _on_toggle)
+            self.var_show_labels.trace("w", _on_toggle)
 
         self._cached_detail_text: Dict[str, str] = {}
         self._cached_device_json: Dict[str, str] = {}
         self._cached_pair_text: Dict[str, str] = {}
+        self._cache_limit = 400  # Clear caches if device count exceeds this
 
         self._build_layout()
 
