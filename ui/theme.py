@@ -120,4 +120,3 @@ def apply_theme(root: tk.Tk | tk.Toplevel, colors: ThemeColors | None = None) ->
 
 def apply_dark_theme(root: tk.Tk | tk.Toplevel, colors: ThemeColors | None = None) -> ThemeColors:
     return apply_theme(root, colors)
-d
