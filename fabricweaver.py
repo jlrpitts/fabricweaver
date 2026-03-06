@@ -497,8 +497,8 @@ FTD_HINT = re.compile(r"firepower|ftd|threat defense|firewall threat defense", r
 
 # show version hints (best effort)
 MODEL_RE = re.compile(r"(?im)^\s*Model\s*:\s*(.+)$|^\s*Model number\s*:\s*(.+)$|^\s*cisco\s+nexus\s+(\S+)", re.MULTILINE)
-NXOS_VER_RE = re.compile(r"(?im)\bNXOS:\s+version\s+(\S+)|\bsystem:\s+version\s+(\S+)", re.MULTILINE)
-IOS_VER_RE = re.compile(r"(?im)\bCisco IOS.*Version\s+([\w.()]+)", re.MULTILINE)
+NXOS_VER_RE = re.compile(r"(?im)\bNXOS:\s+version\s+(\S+)|\bsystem:\s+version\s+(\S+)|^software\s+version\s+(\S+)", re.MULTILINE)
+IOS_VER_RE = re.compile(r"(?im)\bCisco IOS(?:XE)?\s+Software(?:.*\n)*?.*?Version\s+([\w.()]+)|Cisco IOS.*?Version\s+([\S.()]+)", re.MULTILINE)
 EOS_VER_RE = re.compile(r"(?im)\bSoftware image version:\s*(\S+)|\bEOS version\s+(\S+)", re.MULTILINE)
 
 # Description remote hints
@@ -561,8 +561,16 @@ def _parse_show_version(d: DeviceSummary, text: str) -> None:
             if g and g.strip():
                 d.model = g.strip()
                 break
-    vm = NXOS_VER_RE.search(text) or IOS_VER_RE.search(text) or EOS_VER_RE.search(text)
+    
+    # Try NXOS first (most specific for this deployment)
+    vm = NXOS_VER_RE.search(text)
+    if not vm:
+        vm = IOS_VER_RE.search(text)
+    if not vm:
+        vm = EOS_VER_RE.search(text)
+    
     if vm:
+        # Get first non-None group
         for g in vm.groups():
             if g and g.strip():
                 d.os_ver = g.strip()
@@ -3112,12 +3120,23 @@ class FabricWeaverApp(ttk.Frame):
         self.l2_text.configure(state="disabled")
 
         ttk.Label(body, text="VLANs", style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
-        self.vlan_tree = ttk.Treeview(body, columns=("vid", "name"), show="headings", height=6)
+        # Wrap VLAN tree in a frame with scrollbar
+        vlan_frame = ttk.Frame(body)
+        vlan_frame.pack(fill="both", expand=True, pady=(0, 8))
+        
+        self.vlan_tree = ttk.Treeview(vlan_frame, columns=("vid", "name"), show="headings", height=6)
         self.vlan_tree.heading("vid", text="VLAN")
         self.vlan_tree.heading("name", text="Name")
         self.vlan_tree.column("vid", width=70, anchor="w")
         self.vlan_tree.column("name", width=320, anchor="w")
-        self.vlan_tree.pack(fill="x", pady=(0, 8))
+        
+        # Add scrollbar to VLAN tree
+        vlan_scroll = ttk.Scrollbar(vlan_frame, orient="vertical", command=self.vlan_tree.yview)
+        self.vlan_tree.configure(yscroll=vlan_scroll.set)
+        self.vlan_tree.grid(row=0, column=0, sticky="nsew")
+        vlan_scroll.grid(row=0, column=1, sticky="ns")
+        vlan_frame.rowconfigure(0, weight=1)
+        vlan_frame.columnconfigure(0, weight=1)
 
         ttk.Label(body, text="Port-channels", style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
         self.pc_tree = ttk.Treeview(body, columns=("po", "members", "mode", "trunk", "vpc", "peer"),
@@ -3148,18 +3167,40 @@ class FabricWeaverApp(ttk.Frame):
         self.l3_text.configure(state="disabled")
 
         ttk.Label(body, text="SVIs / Routed Interfaces (IP)", style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
-        self.ip_tree = ttk.Treeview(body, columns=("iface", "ip", "vrf"), show="headings", height=7)
+        # Wrap IP tree in a frame with scrollbar
+        ip_frame = ttk.Frame(body)
+        ip_frame.pack(fill="both", expand=True, pady=(0, 8))
+        
+        self.ip_tree = ttk.Treeview(ip_frame, columns=("iface", "ip", "vrf"), show="headings", height=7)
         for c, t, w in [("iface", "Interface", 140), ("ip", "IP/Prefix", 160), ("vrf", "VRF", 120)]:
             self.ip_tree.heading(c, text=t)
             self.ip_tree.column(c, width=w, anchor="w")
-        self.ip_tree.pack(fill="x", pady=(0, 8))
+        
+        # Add scrollbar to IP tree
+        ip_scroll = ttk.Scrollbar(ip_frame, orient="vertical", command=self.ip_tree.yview)
+        self.ip_tree.configure(yscroll=ip_scroll.set)
+        self.ip_tree.grid(row=0, column=0, sticky="nsew")
+        ip_scroll.grid(row=0, column=1, sticky="ns")
+        ip_frame.rowconfigure(0, weight=1)
+        ip_frame.columnconfigure(0, weight=1)
  
-        ttk.Label(body, text="Static Routes (top 20)", style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
-        self.route_tree = ttk.Treeview(body, columns=("vrf", "prefix", "nh"), show="headings", height=6)
+        ttk.Label(body, text="Static Routes", style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
+        # Wrap route tree in a frame with scrollbar for better scrolling
+        route_frame = ttk.Frame(body)
+        route_frame.pack(fill="both", expand=True, pady=(0, 6))
+        
+        self.route_tree = ttk.Treeview(route_frame, columns=("vrf", "prefix", "nh"), show="headings", height=6)
         for c, t, w in [("vrf", "VRF", 120), ("prefix", "Prefix", 170), ("nh", "Next-hop", 150)]:
             self.route_tree.heading(c, text=t)
             self.route_tree.column(c, width=w, anchor="w")
-        self.route_tree.pack(fill="x", pady=(0, 6))
+        
+        # Add scrollbar to route tree
+        route_scroll = ttk.Scrollbar(route_frame, orient="vertical", command=self.route_tree.yview)
+        self.route_tree.configure(yscroll=route_scroll.set)
+        self.route_tree.grid(row=0, column=0, sticky="nsew")
+        route_scroll.grid(row=0, column=1, sticky="ns")
+        route_frame.rowconfigure(0, weight=1)
+        route_frame.columnconfigure(0, weight=1)
 
     def _build_interfaces_tab(self):
         """Build dedicated Interfaces tab."""
@@ -3761,18 +3802,13 @@ class FabricWeaverApp(ttk.Frame):
                     values=(f"  {category_name}", severity.upper(), count_str),
                     tags=(f"category-{severity}",))
                 
-                # Add individual issues
-                for issue in issues[:10]:  # Limit to 10 per category to avoid clutter
+                # Add ALL individual issues (no limit - show all data)
+                for issue in issues:
                     # Format device and message for readability
                     msg_short = issue.message[:120] if len(issue.message) > 120 else issue.message
                     self.validation_tree.insert("", "end", 
                         values=(f"    {issue.device}", severity.upper(), msg_short),
                         tags=(f"issue-{severity}",))
-                
-                if len(issues) > 10:
-                    self.validation_tree.insert("", "end",
-                        values=("", "INFO", f"... and {len(issues) - 10} more {category} issues"),
-                        tags=("more",))
 
     def _refresh_vrf_roles_tab(self):
         """Update VRF and device roles trees."""
@@ -3816,7 +3852,7 @@ class FabricWeaverApp(ttk.Frame):
         if hasattr(self, "vlan_tree"):
             for item in self.vlan_tree.get_children():
                 self.vlan_tree.delete(item)
-            for v in sorted(d.vlans, key=lambda x: int(x.vid) if x.vid.isdigit() else 9999)[:200]:
+            for v in sorted(d.vlans, key=lambda x: int(x.vid) if x.vid.isdigit() else 9999):
                 self.vlan_tree.insert("", "end", values=(v.vid, v.name))
 
         if hasattr(self, "pc_tree"):
@@ -3847,7 +3883,7 @@ class FabricWeaverApp(ttk.Frame):
         if hasattr(self, "route_tree"):
             for item in self.route_tree.get_children():
                 self.route_tree.delete(item)
-            for r in d.static_routes[:20]:
+            for r in d.static_routes:
                 self.route_tree.insert("", "end", values=(r.vrf, r.prefix, r.nexthop))
 
         # Update interfaces tab
@@ -4095,23 +4131,20 @@ class FabricWeaverApp(ttk.Frame):
                 lines.append(f"  ASN           : {d.bgp_asn}")
             if d.bgp_neighbors:
                 lines.append(f"  Neighbors     : {len(d.bgp_neighbors)}")
-                # Show first few BGP neighbors
-                for bgp in d.bgp_neighbors[:5]:
+                # Show ALL BGP neighbors
+                for bgp in d.bgp_neighbors:
                     vrf_str = f" (VRF: {bgp.vrf})" if bgp.vrf != "default" else ""
                     state_str = f" [{bgp.state}]" if bgp.state else ""
                     lines.append(f"    • {bgp.neighbor_ip} AS{bgp.remote_as}{vrf_str}{state_str}")
-                if len(d.bgp_neighbors) > 5:
-                    lines.append(f"    ... and {len(d.bgp_neighbors) - 5} more")
         
         # OSPF details
         if d.ospf_neighbors:
             lines.append(f"")
             lines.append("Routing Protocols - OSPF")
             lines.append(f"  Neighbors     : {len(d.ospf_neighbors)}")
-            for ospf in d.ospf_neighbors[:5]:
+            # Show ALL OSPF neighbors
+            for ospf in d.ospf_neighbors:
                 lines.append(f"    • {ospf.neighbor_id} via {ospf.interface} ({ospf.state})")
-            if len(d.ospf_neighbors) > 5:
-                lines.append(f"    ... and {len(d.ospf_neighbors) - 5} more")
         
         # Loopback details  
         if d.loopbacks:
@@ -4130,23 +4163,19 @@ class FabricWeaverApp(ttk.Frame):
             default_routes = [r for r in d.static_routes if r.prefix == "0.0.0.0/0"]
             other_routes = [r for r in d.static_routes if r.prefix != "0.0.0.0/0"]
             
-            # Show default routes first
+            # Show ALL default routes
             if default_routes:
                 lines.append("  Default Routes:")
-                for route in default_routes[:5]:
+                for route in default_routes:
                     vrf_str = f" (VRF: {route.vrf})" if route.vrf != "default" else ""
                     lines.append(f"    • 0.0.0.0/0 via {route.nexthop}{vrf_str}")
-                if len(default_routes) > 5:
-                    lines.append(f"    ... and {len(default_routes) - 5} more default routes")
             
-            # Show sample of other routes
+            # Show ALL other routes
             if other_routes:
                 lines.append(f"  Other Routes ({len(other_routes)}):")
-                for route in other_routes[:3]:
+                for route in other_routes:
                     vrf_str = f" (VRF: {route.vrf})" if route.vrf != "default" else ""
                     lines.append(f"    • {route.prefix} via {route.nexthop}{vrf_str}")
-                if len(other_routes) > 3:
-                    lines.append(f"    ... and {len(other_routes) - 3} more routes")
         
         # Other L3 info
         lines.append(f"")
@@ -4317,24 +4346,37 @@ class FabricWeaverApp(ttk.Frame):
             y += 10
 
     def _draw_edge_labels(self, canvas, link_labels):
-        """Draw edge labels with improved contrast, collision avoidance, and zoom scaling."""
+        """Draw edge labels with improved contrast, multi-line stacking for same-pair links, and zoom scaling."""
         if not link_labels:
             return
         
-        # Sort by position to process top-to-bottom, left-to-right
-        link_labels.sort(key=lambda l: (l["y1"] + l["y2"], l["x1"] + l["x2"]))
+        # Group labels by device pair to handle multiple links between same devices
+        from collections import defaultdict
+        pair_groups = defaultdict(list)
+        
+        for label_data in link_labels:
+            link = label_data["link"]
+            # Create normalized pair key (sort to treat A-B = B-A)
+            pair_key = tuple(sorted([link.a, link.b]))
+            pair_groups[pair_key].append(label_data)
         
         used_regions = []  # Track label positions to avoid collisions
         
         # Scale font size and background with zoom level
         base_font_size = max(6, int(8 * (self.zoom_level ** 0.6)))
         bg_width = max(50, int(70 * (self.zoom_level ** 0.5)))
-        bg_height = max(10, int(18 * (self.zoom_level ** 0.5)))
+        line_height = max(12, int(16 * (self.zoom_level ** 0.6)))  # Height per line of text
         offset_distance = max(15, int(25 * (self.zoom_level ** 0.5)))
         
-        for label_data in link_labels:
-            x1, y1 = label_data["x1"], label_data["y1"]
-            x2, y2 = label_data["x2"], label_data["y2"]
+        # Process each device pair group
+        for pair_key, labels_in_pair in pair_groups.items():
+            if not labels_in_pair:
+                continue
+            
+            # Use first link's geometry as base position
+            first_label = labels_in_pair[0]
+            x1, y1 = first_label["x1"], first_label["y1"]
+            x2, y2 = first_label["x2"], first_label["y2"]
             
             # Mid-point of edge
             mx = (x1 + x2) / 2
@@ -4358,6 +4400,11 @@ class FabricWeaverApp(ttk.Frame):
                     label_x = mx + perp_x * offset
                     label_y = my + perp_y * offset
                     
+                    # Calculate total height needed for all labels in this group
+                    total_lines = len(labels_in_pair)
+                    total_height = line_height * total_lines
+                    bg_height = max(10, int(total_height / 2 + 4))
+                    
                     # Check collision (scale collision box with zoom)
                     collision = False
                     for region in used_regions:
@@ -4366,20 +4413,27 @@ class FabricWeaverApp(ttk.Frame):
                             break
                     
                     if not collision:
-                        # Draw label with dark rounded background (simulated with rectangle)
-                        label_text = label_data["text"]
+                        # Build multi-line text for all links in this pair
+                        label_lines = []
+                        for label_data in labels_in_pair:
+                            link = label_data["link"]
+                            # Compact format: interfaces and evidence on one line
+                            line_text = f"{link.a_intf} ↔ {link.b_intf} ({link.evidence})"
+                            label_lines.append(line_text)
                         
-                        # Create dark background
+                        combined_text = "\n".join(label_lines)
+                        
+                        # Create dark background sized for multi-line text
                         canvas.create_rectangle(
                             label_x - bg_width, label_y - bg_height,
                             label_x + bg_width, label_y + bg_height,
                             fill=self.colors.panel2, outline=self.colors.border, width=max(1, int(self.zoom_level))
                         )
                         
-                        # Draw text with high contrast and scaled font
+                        # Draw multi-line text with high contrast and scaled font
                         canvas.create_text(
                             label_x, label_y,
-                            text=label_text, fill="#e8e3d7",
+                            text=combined_text, fill="#e8e3d7",
                             font=("Segoe UI", base_font_size, "bold"),
                             justify="center"
                         )
@@ -4389,7 +4443,18 @@ class FabricWeaverApp(ttk.Frame):
                         break
                 
                 # Fallback: just place it if no good location found
-                if not placed and link_labels.index(label_data) < 5:  # Only fallback for first few
+                if not placed:
+                    label_lines = []
+                    for label_data in labels_in_pair:
+                        link = label_data["link"]
+                        line_text = f"{link.a_intf} ↔ {link.b_intf} ({link.evidence})"
+                        label_lines.append(line_text)
+                    
+                    combined_text = "\n".join(label_lines)
+                    total_lines = len(labels_in_pair)
+                    total_height = line_height * total_lines
+                    bg_height = max(10, int(total_height / 2 + 4))
+                    
                     canvas.create_rectangle(
                         mx - bg_width, my - bg_height,
                         mx + bg_width, my + bg_height,
@@ -4397,63 +4462,42 @@ class FabricWeaverApp(ttk.Frame):
                     )
                     canvas.create_text(
                         mx, my,
-                        text=label_data["text"], fill="#e8e3d7",
+                        text=combined_text, fill="#e8e3d7",
                         font=("Segoe UI", base_font_size, "bold"),
                         justify="center"
                     )
 
     def _format_node_info(self, d: DeviceSummary) -> List[str]:
-        """Format device info for display inside topology node with compact layout."""
+        """Format device info for display inside topology node - clean and minimal."""
         lines = []
         
-        # Header: hostname + vendor/model/os
+        # Line 1: Hostname
         lines.append(d.hostname)
-        model_str = f"{d.vendor} {d.model}" if d.model != "—" else d.vendor
-        lines.append(f"{model_str} / {d.os_ver}")
         
-        # Redundancy section if applicable (short version)
-        if d.vpc_configured:
-            po_str = d.vpc_peerlink_po if d.vpc_peerlink_po else "—"
-            lines.append(f"vPC {d.vpc_domain} ({po_str})")
-        elif d.vlt_domain:
-            lines.append(f"VLT {d.vlt_domain}")
-        elif d.mlag_domain:
-            lines.append(f"MLAG {d.mlag_domain}")
+        # Line 2: Device type (vendor and model if available)
+        if d.model and d.model != "—":
+            device_type = f"{d.vendor} {d.model}"
+        else:
+            device_type = d.vendor
+        lines.append(device_type)
         
-        # L2 summary (condensed)
-        trunks = sum(1 for i in d.interfaces.values() if i.mode == "trunk")
-        access = sum(1 for i in d.interfaces.values() if i.mode == "access")
-        svi_count = sum(1 for i in d.interfaces.values() if i.is_svi and i.ip)
+        # Line 3: Code version
+        code_version = d.os_ver if d.os_ver and d.os_ver != "—" else "Version unknown"
+        lines.append(code_version)
         
-        lines.append(f"L2  {len(d.vlans)}VLANs  {trunks}T  {access}A  {len(d.port_channels)}PC")
-        
-        # L3 summary (condensed)
-        vrf_count = len(d.vrfs) if d.vrfs else 1
-        bgp_asn = d.bgp_asn or "—"
-        bgp_neighbors = 0
-        
-        # Count BGP neighbors from topology links
-        for link in self._topo.links:
-            if link.kind == "L3" and (link.a == d.hostname or link.b == d.hostname):
-                bgp_neighbors += 1
-        
-        lines.append(f"L3  {svi_count}SVI  {vrf_count}VRF  BGP {bgp_asn}({bgp_neighbors})")
-        
-        # Topology connections summary (condensed)
-        neighbors = set()
-        for link in self._topo.links:
-            if link.a == d.hostname:
-                neighbors.add(link.b)
-            elif link.b == d.hostname:
-                neighbors.add(link.a)
-        
-        if neighbors:
-            # Limit neighbor list if too many
-            neighbor_list = sorted(neighbors)
-            if len(neighbor_list) > 3:
-                lines.append(f"Peers: {', '.join(neighbor_list[:3])} +{len(neighbor_list)-3}")
-            else:
-                lines.append(f"Peers: {', '.join(neighbor_list)}")
+        # Line 4: Default route (find 0.0.0.0/0 in static routes)
+        default_route = "No default route"
+        for route in d.static_routes:
+            if route.prefix in ("0.0.0.0/0", "0.0.0.0 0.0.0.0", "::/0"):
+                if route.nexthop:
+                    # Show full route with prefix and nexthop
+                    prefix_display = route.prefix if route.prefix != "0.0.0.0 0.0.0.0" else "0.0.0.0/0"
+                    nh_display = route.nexthop if len(route.nexthop) <= 25 else route.nexthop[:22] + "..."
+                    default_route = f"Default: {prefix_display} via {nh_display}"
+                else:
+                    default_route = "Default: 0.0.0.0/0 (configured)"
+                break
+        lines.append(default_route)
         
         return lines
 
@@ -4531,9 +4575,10 @@ class FabricWeaverApp(ttk.Frame):
             is_active = (name == self._active_device)
 
             # Scale node size with zoom to prevent text overlap
-            base_node_w, base_node_h = 480, 240
+            # Increased width to accommodate full default route display with prefix (0.0.0.0/0 via IP)
+            base_node_w, base_node_h = 520, 160
             node_w = max(320, int(base_node_w * (self.zoom_level ** 0.7)))
-            node_h = max(200, int(base_node_h * (self.zoom_level ** 0.7)))
+            node_h = max(140, int(base_node_h * (self.zoom_level ** 0.7)))
             x0 = x - node_w // 2
             y0 = y - node_h // 2
             x1 = x + node_w // 2
