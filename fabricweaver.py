@@ -723,8 +723,12 @@ def _parse_interfaces_and_portchannels(d: DeviceSummary, text: str) -> None:
             if vpc_m:
                 pc.vpc_id = vpc_m.group(1).strip()
 
-            # peer-link marker
-            if VPC_PEERLINK_CMD_RE.search(block) or ("peer-link" in (iface.description or "").lower()):
+            # peer-link marker - check multiple variations
+            desc_lower = (iface.description or "").lower()
+            has_peer_cmd = VPC_PEERLINK_CMD_RE.search(block)
+            has_peer_desc = "peer-link" in desc_lower or "peer link" in desc_lower or "peerlink" in desc_lower
+            
+            if has_peer_cmd or has_peer_desc:
                 pc.is_peer_link = True
 
             # MLAG member
@@ -1086,6 +1090,26 @@ def _parse_vpc_mlag_vlt(d: DeviceSummary, text: str) -> None:
             d.vpc_peerlink_po = f"port-channel{pc_id}"
             d.vpc_peerlink_members = list(pc.members)
             break
+    
+    # Fallback: if vpc_configured but no peer-link found, use heuristics
+    # (e.g., largest port-channel that's not a vPC member, or one with specific naming)
+    if d.vpc_configured and not d.vpc_peerlink_po:
+        non_vpc_pcs = [(pc_id, pc) for pc_id, pc in d.port_channels.items() if not pc.vpc_id]
+        if non_vpc_pcs:
+            # Prefer the port-channel with 'peer' in description
+            peer_named = [p for p in non_vpc_pcs if "peer" in (p[1].description or "").lower()]
+            if peer_named:
+                pc_id, pc = peer_named[0]
+                d.vpc_peerlink_po = f"port-channel{pc_id}"
+                d.vpc_peerlink_members = list(pc.members)
+                logger.debug(f"Peer-link inferred for {d.hostname}: {d.vpc_peerlink_po} (from description)")
+            else:
+                # Otherwise, use largest port-channel without vpc_id
+                pc_id, pc = max(non_vpc_pcs, key=lambda x: int(x[0]) if x[0].isdigit() else 0)
+                if int(pc_id) > 0:
+                    d.vpc_peerlink_po = f"port-channel{pc_id}"
+                    d.vpc_peerlink_members = list(pc.members)
+                    logger.debug(f"Peer-link inferred for {d.hostname}: {d.vpc_peerlink_po} (fallback, largest non-vPC)")
 
     # VLT
     vltd = VLT_DOMAIN_RE.search(text)
@@ -1753,6 +1777,16 @@ def _infer_vpc_pairs(topo: TopologyData) -> List[PairInference]:
 
             if reasons:
                 considered.add(key)
+                # Note: Check if both devices have peerlink detected for complete vPC topology
+                missing_peerlink = []
+                if da.vpc_configured and not da.vpc_peerlink_po:
+                    missing_peerlink.append(a)
+                if db.vpc_configured and not db.vpc_peerlink_po:
+                    missing_peerlink.append(b)
+                
+                if missing_peerlink:
+                    logger.debug(f"VPC pair {key} inferred but peer-link missing on: {missing_peerlink}")
+                
                 pairs.append(PairInference(
                     kind="vPC", a=a, b=b, confidence=confidence,
                     reasons=reasons,
