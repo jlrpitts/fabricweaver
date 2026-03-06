@@ -1700,7 +1700,7 @@ class FabricWeaverApp(ttk.Frame):
             self.ip_tree.heading(c, text=t)
             self.ip_tree.column(c, width=w, anchor="w")
         self.ip_tree.pack(fill="x", pady=(0, 8))
-
+ 
         ttk.Label(body, text="Static Routes (top 20)", style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
         self.route_tree = ttk.Treeview(body, columns=("vrf", "prefix", "nh"), show="headings", height=6)
         for c, t, w in [("vrf", "VRF", 120), ("prefix", "Prefix", 170), ("nh", "Next-hop", 150)]:
